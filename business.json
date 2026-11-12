@@ -1,0 +1,16 @@
+{
+  "name": "SHINE AUTOWERKZ",
+  "address": "297G Đ.Liên Phường, Phường Phú Hữu, TP Thủ Đức, TP Hồ Chí Minh",
+  "hotline": "0966291909",
+  "hours": "8h - 17h30, từ thứ 2 đến Chủ Nhật",
+  "invoice_title": "HÓA ĐƠN DỊCH VỤ",
+  "accent_color": "#B91C1C",
+  "footer_text": "Cảm ơn quý khách!\nHẹn gặp lại!",
+  "bank": {
+    "short_name": "TCB",
+    "bin": "970407",
+    "account": "262586",
+    "account_name": "CONG TY CO PHAN SHINE AUTOWERKZ",
+    "template": "compact2"
+  }
+}

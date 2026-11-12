@@ -1,0 +1,26 @@
+BOT SHINE AUTOWERKZ: HOÁ ĐƠN + VIẾT BÀI FANPAGE + BÁO GIÁ
+===========================================================
+
+1. Cài Python 3.11 trở lên (python.org). Khi cài nhớ tick "Add python.exe to PATH".
+
+2. Tạo file .env:
+   - Cách nhanh: chép file .env từ thư mục shine-invoice-bot ở máy cũ sang đây.
+   - Hoặc đổi tên .env.example thành .env rồi điền token, ID, tài khoản API AlphaWash, GEMINI_API_KEY.
+
+3. (Nên làm) Chép từ máy cũ sang:
+   - assets\logo.png  -> logo trên hoá đơn và báo giá
+   - fonts\BeVietnamPro-Regular.ttf, fonts\BeVietnamPro-Bold.ttf -> font hoá đơn
+   Thiếu 2 thứ này bot vẫn chạy: hoá đơn dùng font Arial, báo giá hiện chữ thay logo.
+
+4. Bấm đúp chay_bot.bat. Lần đầu sẽ tự tạo .venv và cài thư viện (mất vài phút).
+
+LƯU Ý: Mỗi token bot chỉ được chạy ở MỘT máy. Nếu máy cũ còn chạy bot thì phải tắt bên đó,
+nếu không 2 máy sẽ giành tin nhắn (Telegram báo lỗi Conflict).
+
+Lệnh trong bot:
+  /hoadon  tạo phiếu từng bước       /lichsu  tra phiếu theo biển số
+  /in      xuất lại phiếu            /homnay  doanh thu hôm nay (quản lý)
+  /post    viết bài fanpage          /baogia  tạo bảng báo giá (ảnh + PDF)
+  /huy     huỷ việc đang làm         /myid    xem ID Telegram
+
+Sửa gói, giá, quà tặng, ghi chú báo giá: mở quote_templates.json.

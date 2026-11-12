@@ -1,0 +1,42 @@
+{
+  "_ghi_chu": "Các giá trị gửi/nhận với BE AlphaWash. CASH/PAID/COMPLETED lấy từ ví dụ trong doc BE. TRANSFER, CARD, UNPAID là ĐOÁN — đối chiếu với OrderServiceImpl rồi sửa tại đây, không cần sửa code.",
+  "payment_options": [
+    {
+      "key": "cash",
+      "label": "💵 Tiền mặt",
+      "display": "Tiền mặt",
+      "paymentType": "CASH",
+      "paymentStatus": "PAID"
+    },
+    {
+      "key": "bank",
+      "label": "🏦 Chuyển khoản",
+      "display": "Chuyển khoản",
+      "paymentType": "TRANSFER",
+      "paymentStatus": "PAID"
+    },
+    {
+      "key": "card",
+      "label": "💳 Quẹt thẻ",
+      "display": "Quẹt thẻ",
+      "paymentType": "CARD",
+      "paymentStatus": "PAID"
+    },
+    {
+      "key": "unpaid",
+      "label": "⏳ Chưa thanh toán",
+      "display": "Chưa thanh toán",
+      "paymentType": null,
+      "paymentStatus": "UNPAID"
+    }
+  ],
+  "paid_status": "PAID",
+  "order_detail_status": "COMPLETED",
+  "total_price_mode": "gross",
+  "dashboard_date_format": "%Y-%m-%d",
+  "invoice_pdf": {
+    "_ghi_chu": "Endpoint BE trả PDF hoá đơn (có QR). Để path rỗng = tắt (bot tạm gửi ảnh tự vẽ, KHÔNG có QR). Dùng {id} (UUID đơn) hoặc {code} (mã ORD-...) trong path, VD: /api/orders/{id}/pdf. Bot tự nhận: file PDF trực tiếp, base64 trong JSON, hoặc JSON chứa link tải.",
+    "method": "GET",
+    "path": ""
+  }
+}

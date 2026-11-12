@@ -1,0 +1,63 @@
+{
+  "company": {
+    "name": "CÔNG TY CỔ PHẦN SHINE AUTOWERKZ",
+    "lines": [
+      "Địa chỉ: 297G Liên Phường, P. Long Trường, TP. HCM",
+      "Mã số thuế: 0319062716",
+      "Hotline: 0966.291.909"
+    ]
+  },
+  "slogan": "Build Your Shine",
+  "signer_title": "NGƯỜI PHỤ TRÁCH",
+  "signer_note": "(Ký, ghi rõ họ tên)",
+  "notes": [
+    {"label": "Lưu ý:", "text": "Quý khách vui lòng chọn 1 trong {n} option."},
+    {"label": "(*) Chăm sóc xe Level 1:", "text": "rửa xe chi tiết gồm rửa gầm, rửa thân xe bằng dung dịch tiền xử lý và bọt tuyết, vệ sinh mâm, lốp và lòng vè, thổi khô khe kẽ, hút bụi và lau nội thất, vệ sinh thảm, lau kính, dưỡng sơn, dưỡng lốp và kiểm tra áp suất lốp."},
+    {"label": "Bảo hành:", "text": "Chỉ áp dụng cho **lỗi kỹ thuật**, gồm lỗi sản phẩm (nứt, bong keo) và lỗi thi công (bong mép, phồng rộp, bọt khí). Không áp dụng cho hư hỏng do tác động bên ngoài (tai nạn, va quẹt, trầy xước mới) hoặc do sử dụng, vệ sinh sai cách. Vui lòng mang theo hoá đơn khi yêu cầu bảo hành."}
+  ],
+  "templates": [
+    {
+      "id": "ppf_full",
+      "name": "Dán full xe PPF",
+      "title": "DÁN FULL XE PPF",
+      "sizes": ["Sedan", "SUV", "MPV / 7 chỗ", "Bán tải"],
+      "rows": ["Thương hiệu", "Loại phim", "Bảo hành", "Quà tặng kèm", "Ưu đãi dán lại"],
+      "options": [
+        {
+          "name": "OPTION 1 – TIÊU CHUẨN",
+          "values": {
+            "Thương hiệu": "TeckWrap",
+            "Loại phim": "X75",
+            "Bảo hành": "4 năm",
+            "Quà tặng kèm": [
+              "Full PPF nội thất",
+              "Chăm sóc toàn bộ kính",
+              "Phủ kính toàn bộ xe",
+              "Bảo dưỡng 1 năm (3 tháng/lần)",
+              "02 lần chăm sóc xe Level 1*"
+            ],
+            "Ưu đãi dán lại": "–"
+          },
+          "prices": {"SUV": 33000000}
+        },
+        {
+          "name": "OPTION 2 – CAO CẤP",
+          "values": {
+            "Thương hiệu": "STEK",
+            "Loại phim": "ForceShield",
+            "Bảo hành": "5 năm – Bảo hành điện tử STEK One",
+            "Quà tặng kèm": [
+              "Full PPF nội thất",
+              "Chăm sóc toàn bộ kính",
+              "Phủ kính toàn bộ xe",
+              "Bảo dưỡng 2 năm (3 tháng/lần)",
+              "04 lần chăm sóc xe Level 1*"
+            ],
+            "Ưu đãi dán lại": "Giảm 30% / lần, áp dụng 3 lần đầu"
+          },
+          "prices": {"SUV": 55000000}
+        }
+      ]
+    }
+  ]
+}
