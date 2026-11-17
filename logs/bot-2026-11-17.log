@@ -1,0 +1,38 @@
+ 
+==================== START 17/11/2026 22:39:39.72 ==================== 
+Traceback (most recent call last):
+  File "E:\ShineAutowerkz\Software\shine-invoice-bot\bot.py", line 24, in <module>
+    import post_handler
+  File "E:\ShineAutowerkz\Software\shine-invoice-bot\post_handler.py", line 19, in <module>
+    from google import genai
+ModuleNotFoundError: No module named 'google'
+==================== EXIT  17/11/2026 22:39:41.89 (code 1) ==================== 
+ 
+==================== START 17/11/2026 22:40:26.37 ==================== 
+Traceback (most recent call last):
+  File "E:\ShineAutowerkz\Software\shine-invoice-bot\bot.py", line 24, in <module>
+    import post_handler
+  File "E:\ShineAutowerkz\Software\shine-invoice-bot\post_handler.py", line 19, in <module>
+    from google import genai
+ModuleNotFoundError: No module named 'google'
+==================== EXIT  17/11/2026 22:40:26.89 (code 1) ==================== 
+ 
+==================== START 17/11/2026 22:45:13.81 ==================== 
+2026-11-17 22:45:34,016 INFO zalo_bot: Zalo bot đang chạy: bot.RUzuHzob
+2026-11-17 22:45:34,141 INFO apscheduler.scheduler: Scheduler started
+2026-11-17 22:45:34,141 INFO telegram.ext.Application: Application started
+^C 
+==================== START 17/11/2026 22:48:48.93 ==================== 
+The system cannot find the path specified.
+The system cannot find the path specified.
+==================== EXIT  17/11/2026 22:48:48.95 (code 3) ==================== 
+ 
+==================== START 17/11/2026 22:52:17.12 ==================== 
+Dang tao lai .venv, lan dau mat vai phut... 
+'py' is not recognized as an internal or external command,
+operable program or batch file.
+2026-11-17 22:52:49,319 INFO zalo_bot: Zalo bot đang chạy: bot.RUzuHzob
+2026-11-17 22:52:49,441 INFO apscheduler.scheduler: Scheduler started
+2026-11-17 22:52:49,441 INFO telegram.ext.Application: Application started
+2026-11-17 22:56:14,961 INFO zalo_bot: Zalo quick order O17112026-008 created by Mạnh Quân Shineautowerkz
+2026-11-17 22:56:15,136 WARNING zalo_bot: Zalo sendPhoto QR lỗi: sendPhoto: 424 The photo URL is invalid. Please check your image link, make sure it uses HTTPS and that the image size is valid.

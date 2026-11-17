@@ -19,6 +19,8 @@ import config
 import orders
 from api import AlphaWashClient, BackendError
 from invoice_image import render_invoice
+from quick_core import (_QUICK_PLATE_RE, _find_brand_model, _find_employee, _find_service, _head,  # noqa: F401
+                        _new_draft, _parse_quick, _quick_norm, _quick_tokens, _vehicle_from_check)
 import post_handler
 import quote
 from zalo_bot import ZaloBot
@@ -104,16 +106,6 @@ async def _fail(update: Update, ctx: ContextTypes.DEFAULT_TYPE, e: BackendError)
     return ConversationHandler.END
 
 
-def _head(d: dict) -> str:
-    v = d["vehicle"]
-    head = f"🚗 {v['plate']}" + (f" · {v['label']}" if v.get("label") else "")
-    if v.get("size"):
-        head += f" · size {v['size']}"
-    if v.get("customerName"):
-        head += f"\n👤 {v['customerName']}"
-    return head
-
-
 def _selected_text(d: dict) -> str:
     lines = d["lines"]
     return f"\n\n✅ Đã chọn {len(lines)} mục — {money(orders.subtotal(lines))}" if lines else ""
@@ -171,11 +163,6 @@ def confirm_view(d: dict) -> tuple[str, InlineKeyboardMarkup]:
 # --------------------------------------------------------------------------- #
 # Luồng tạo phiếu
 # --------------------------------------------------------------------------- #
-def _new_draft() -> dict:
-    return {"vehicle": None, "groups": [], "lines": [], "emps": [], "emp_sel": [], "discount": 0,
-            "payment_key": "", "note": "", "models": [], "recent": [], "adj_index": None}
-
-
 @staff_only
 async def start_invoice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     d = ctx.user_data["draft"] = _new_draft()
@@ -194,18 +181,6 @@ async def start_invoice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         + "\n(Gõ /huy để thoát)",
         reply_markup=InlineKeyboardMarkup(rows) if rows else None)
     return PLATE
-
-
-def _vehicle_from_check(res: dict, plate: str) -> dict:
-    v = res.get("vehicle") or {}
-    model = v.get("model") or {}
-    brand = v.get("brand") or model.get("brand") or {}
-    cust = v.get("customer") or res.get("customer") or {}
-    return {"plate": v.get("licensePlate") or plate,
-            "label": " ".join(x for x in (brand.get("brandName"), model.get("modelName")) if x),
-            "size": str(model.get("size") or "").upper(),
-            "brandCode": brand.get("code"), "modelCode": model.get("code"),
-            "customerId": cust.get("id"), "customerName": cust.get("customerName")}
 
 
 async def got_plate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -642,82 +617,6 @@ async def stale_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # --------------------------------------------------------------------------- #
 # Nhập nhanh: gõ 1 tin nhắn nhiều dòng, bot parse + tạo phiếu
 # --------------------------------------------------------------------------- #
-_QUICK_PLATE_RE = re.compile(r"\d{2}[A-Z]{1,2}[\-.]?\d{4,5}", re.IGNORECASE)
-
-
-def _quick_norm(s: str) -> str:
-    """Fold + chuẩn hoá viết tắt phổ biến (lv1 -> level 1)."""
-    s = fold(s)
-    s = re.sub(r"\blv\s*(\d)", r"level \1", s)
-    return s
-
-
-def _quick_tokens(s: str) -> list[str]:
-    return re.findall(r"[a-z0-9]+", _quick_norm(s))
-
-
-def _parse_quick(text: str) -> dict | None:
-    """Tách text người dùng gõ: dòng có biển số -> xe (kèm brand/model nếu có),
-    dòng bắt đầu @ -> thợ, còn lại -> dịch vụ. Không tìm thấy biển số -> None."""
-    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
-    result = {"plate": None, "brand": None, "model": None, "services": [], "employees": []}
-    for ln in lines:
-        if ln.startswith("@"):
-            name = ln[1:].strip()
-            if name:
-                result["employees"].append(name)
-            continue
-        if not result["plate"] and _QUICK_PLATE_RE.search(ln.upper()):
-            parts = [p.strip() for p in re.split(r"[\/|]", ln) if p.strip()]
-            if len(parts) >= 3:
-                result["brand"], result["model"], plate_txt = parts[0], parts[1], parts[2]
-            else:
-                plate_txt = _QUICK_PLATE_RE.search(ln.upper()).group(0)
-            result["plate"] = plate_txt
-            continue
-        result["services"].append(ln)
-    return result if result["plate"] else None
-
-
-def _find_service(groups: list[dict], query: str) -> dict | None:
-    q = _quick_tokens(query)
-    if not q:
-        return None
-    for g in groups:
-        for s in g["services"]:
-            hay = _quick_tokens(s["name"])
-            if all(t in hay for t in q):
-                return s
-    return None
-
-
-def _find_employee(emps: list[dict], query: str) -> dict | None:
-    q = _quick_tokens(query)
-    if not q:
-        return None
-    for e in emps:
-        if not e.get("name") or (e.get("workStatus") or "Working") != "Working":
-            continue
-        if all(t in _quick_tokens(e["name"]) for t in q):
-            return e
-    return None
-
-
-def _find_brand_model(brands: list[dict], brand_q: str, model_q: str) -> dict | None:
-    b_toks = _quick_tokens(brand_q or "")
-    m_toks = _quick_tokens(model_q or "")
-    for b in brands:
-        if b_toks and not all(t in _quick_tokens(b.get("brandName", "")) for t in b_toks):
-            continue
-        for m in b.get("models") or []:
-            if m_toks and not all(t in _quick_tokens(m.get("modelName", "")) for t in m_toks):
-                continue
-            return {"brandCode": b.get("code"), "brandName": b.get("brandName"),
-                    "modelCode": m.get("code"), "modelName": m.get("modelName"),
-                    "size": str(m.get("size") or "").upper()}
-    return None
-
-
 def _quick_summary(d: dict) -> str:
     lines = ["🚀 Nhập nhanh — chọn hình thức thanh toán để tạo phiếu:", _head(d), ""]
     for n, l in enumerate(d["lines"], 1):
@@ -1005,9 +904,9 @@ async def post_init(app: Application) -> None:
         BotCommand("post", "Viết bài đăng fanpage"),
         BotCommand("baogia", "Tạo bảng báo giá"),
     ])
-    # Bot Zalo viết bài chạy song song (chỉ khi có ZALO_BOT_TOKEN + GEMINI_API_KEY)
-    if os.getenv("ZALO_BOT_TOKEN") and os.getenv("GEMINI_API_KEY"):
-        task = asyncio.create_task(ZaloBot(os.environ["ZALO_BOT_TOKEN"]).run())
+    # Bot Zalo (viết bài + nhập nhanh hoá đơn) chạy song song khi có ZALO_BOT_TOKEN
+    if os.getenv("ZALO_BOT_TOKEN"):
+        task = asyncio.create_task(ZaloBot(os.environ["ZALO_BOT_TOKEN"], api=app.bot_data["api"]).run())
         task.add_done_callback(
             lambda t: t.cancelled() or not t.exception()
             or log.error("Bot Zalo dừng vì lỗi: %s (kiểm tra ZALO_BOT_TOKEN)", t.exception()))

@@ -16,8 +16,11 @@ import os
 import re
 import warnings
 
-from google import genai
-from google.genai import errors as genai_errors
+try:
+    from google import genai
+    from google.genai import errors as genai_errors
+except ImportError:  # chưa cài google-genai -> /post báo lỗi, các chức năng khác vẫn chạy
+    genai = genai_errors = None
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -53,7 +56,7 @@ TONES = {
 SERVICE, CAR, DETAIL, PROMO, TONE = range(5)
 SKIP_WORDS = {"-", "bỏ qua", "bo qua", "không", "khong", "k", "ko"}
 
-_client: genai.Client | None = None
+_client = None
 _allowed_override: set[int] | None = None  # bot hoá đơn truyền STAFF_USER_IDS vào đây
 _model: str | None = None
 
@@ -62,8 +65,10 @@ class PostError(Exception):
     """Lỗi có sẵn câu báo tiếng Việt để gửi cho người dùng."""
 
 
-def _gemini() -> genai.Client:
+def _gemini():
     global _client
+    if genai is None:
+        raise PostError("❌ Máy chạy bot chưa cài thư viện Gemini. Quản lý chạy: .venv\\Scripts\\pip install google-genai")
     if _client is None:
         _client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
     return _client
@@ -151,7 +156,11 @@ async def generate_post(d: dict, variant: bool = False) -> str:
         try:
             model = await _get_model()
             resp = await _gemini().aio.models.generate_content(model=model, contents=prompt, config=config)
-        except genai_errors.APIError as e:
+        except PostError:
+            raise
+        except Exception as e:
+            if genai_errors is None or not isinstance(e, genai_errors.APIError):
+                raise
             log.warning("Gemini lỗi %s: %s", e.code, e.message)
             if e.code == 404 and attempt == 0:  # model bị đổi tên/ngừng -> tự chọn lại
                 _model = await _pick_model()

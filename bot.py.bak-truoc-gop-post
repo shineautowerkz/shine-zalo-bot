@@ -1,0 +1,1067 @@
+"""Bot Telegram tạo phiếu thanh toán (xuất ảnh) cho Shine Autowerkz.
+
+Dữ liệu đọc/ghi qua API AlphaWash (không lưu dữ liệu nghiệp vụ trong bot).
+Chạy:  python bot.py
+"""
+import asyncio
+import io
+import logging
+import re
+from datetime import datetime, timedelta
+from functools import wraps
+
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
+                          ConversationHandler, MessageHandler, filters)
+
+import config
+import orders
+from api import AlphaWashClient, BackendError
+from invoice_image import render_invoice
+from utils import canonical_plate, fold, money, parse_discount, parse_dt, parse_money, plate_key
+
+logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+log = logging.getLogger("shine-bot")
+
+(PLATE, MODEL, SIZE, SERVICES, ADJ_PICK, ADJ_INPUT, EMPLOYEES,
+ DISCOUNT, DISCOUNT_INPUT, PAYMENT, NOTE, CONFIRM) = range(12)
+
+SIZES = ("S", "M", "L", "XL")
+TEXT = filters.TEXT & ~filters.COMMAND
+
+
+def api_of(ctx: ContextTypes.DEFAULT_TYPE) -> AlphaWashClient:
+    return ctx.application.bot_data["api"]
+
+
+# --------------------------------------------------------------------------- #
+# Phân quyền
+# --------------------------------------------------------------------------- #
+def _deny_text(user_id: int | None) -> str:
+    return ("⛔ Bạn chưa được cấp quyền dùng bot này.\n"
+            f"ID Telegram của bạn: {user_id}\n"
+            "Gửi ID này cho quản lý để được thêm vào.")
+
+
+def staff_only(func):
+    @wraps(func)
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *a, **kw):
+        user = update.effective_user
+        if user is None or user.id not in config.STAFF_USER_IDS:
+            if update.effective_message:
+                await update.effective_message.reply_text(_deny_text(user.id if user else None))
+            return ConversationHandler.END
+        return await func(update, ctx, *a, **kw)
+    return wrapper
+
+
+def admin_only(func):
+    @wraps(func)
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *a, **kw):
+        user = update.effective_user
+        if user is None or user.id not in config.ADMIN_USER_IDS:
+            await update.effective_message.reply_text("⛔ Lệnh này chỉ dành cho quản lý.")
+            return
+        return await func(update, ctx, *a, **kw)
+    return wrapper
+
+
+# --------------------------------------------------------------------------- #
+# Tiện ích giao diện
+# --------------------------------------------------------------------------- #
+def btn(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text, callback_data=data)
+
+
+CANCEL_ROW = [btn("❌ Huỷ", "cancel")]
+
+
+async def show(update: Update, text: str, kb: InlineKeyboardMarkup | None = None) -> None:
+    """Sửa tin nhắn nếu vừa bấm nút, ngược lại gửi tin mới."""
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=kb)
+    else:
+        await update.effective_message.reply_text(text, reply_markup=kb)
+
+
+def get_draft(ctx: ContextTypes.DEFAULT_TYPE) -> dict | None:
+    return ctx.user_data.get("draft")
+
+
+async def _expired(update: Update) -> int:
+    await show(update, "Phiếu đã hết hạn, gõ /hoadon để tạo lại.")
+    return ConversationHandler.END
+
+
+async def _fail(update: Update, ctx: ContextTypes.DEFAULT_TYPE, e: BackendError) -> int:
+    ctx.user_data.pop("draft", None)
+    await show(update, f"⚠️ {e.message}\n\nGõ /hoadon để thử lại.")
+    return ConversationHandler.END
+
+
+def _head(d: dict) -> str:
+    v = d["vehicle"]
+    head = f"🚗 {v['plate']}" + (f" · {v['label']}" if v.get("label") else "")
+    if v.get("size"):
+        head += f" · size {v['size']}"
+    if v.get("customerName"):
+        head += f"\n👤 {v['customerName']}"
+    return head
+
+
+def _selected_text(d: dict) -> str:
+    lines = d["lines"]
+    return f"\n\n✅ Đã chọn {len(lines)} mục — {money(orders.subtotal(lines))}" if lines else ""
+
+
+def groups_view(d: dict) -> tuple[str, InlineKeyboardMarkup]:
+    chosen = {l["code"] for l in d["lines"]}
+    rows = []
+    for gi, g in enumerate(d["groups"]):
+        n = sum(1 for s in g["services"] if s["code"] in chosen)
+        rows.append([btn(f"📂 {g['name']}" + (f" ({n})" if n else ""), f"g:{gi}")])
+    rows.append([btn("✔️ Xong", "done"), btn("✏️ Sửa giá", "adj")])
+    rows.append(CANCEL_ROW)
+    return f"{_head(d)}\n\nChọn nhóm dịch vụ:{_selected_text(d)}", InlineKeyboardMarkup(rows)
+
+
+def group_view(d: dict, gi: int) -> tuple[str, InlineKeyboardMarkup]:
+    g = d["groups"][gi]
+    chosen = {l["code"] for l in d["lines"]}
+    rows = [[btn(f"{'✅' if s['code'] in chosen else '⬜'} {s['name']} — {money(s['price'])}", f"s:{gi}:{si}")]
+            for si, s in enumerate(g["services"])]
+    rows.append([btn("⬅️ Nhóm khác", "groups"), btn("✔️ Xong", "done")])
+    return f"{_head(d)}\n\n📂 {g['name']} (bấm để chọn / bỏ chọn):{_selected_text(d)}", InlineKeyboardMarkup(rows)
+
+
+def employees_view(d: dict) -> tuple[str, InlineKeyboardMarkup]:
+    btns = [btn(f"{'✅' if e['id'] in d['emp_sel'] else '⬜'} {e['name']}", f"e:{e['id']}") for e in d["emps"]]
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    rows.append([btn("✔️ Xong / Bỏ qua", "edone")])
+    rows.append(CANCEL_ROW)
+    return "👷 Ai thực hiện? (chọn nhiều người được)", InlineKeyboardMarkup(rows)
+
+
+def confirm_view(d: dict) -> tuple[str, InlineKeyboardMarkup]:
+    sub = orders.subtotal(d["lines"])
+    lines = ["🧾 XÁC NHẬN PHIẾU", _head(d), ""]
+    for n, l in enumerate(d["lines"], 1):
+        extra = f" (giá gốc {money(l['listed'])}: {l['reason']})" if l["adjusted"] is not None else ""
+        lines.append(f"{n}. {l['name']} — {money(orders.line_price(l))}{extra}")
+    lines.append("")
+    if d["discount"]:
+        lines += [f"Tạm tính: {money(sub)}", f"Giảm giá: -{money(d['discount'])}"]
+    lines.append(f"💰 TỔNG: {money(sub - d['discount'])}")
+    lines.append(f"Thanh toán: {orders.payment_option(d['payment_key'])['display']}")
+    names = [e["name"] for e in d["emps"] if e["id"] in d["emp_sel"]]
+    if names:
+        lines.append(f"Thực hiện: {', '.join(names)}")
+    if d["note"]:
+        lines.append(f"Ghi chú: {d['note']}")
+    kb = InlineKeyboardMarkup([[btn("✅ Xuất phiếu", "ok")],
+                               [btn("✏️ Sửa dịch vụ", "edit"), btn("❌ Huỷ", "cancel")]])
+    return "\n".join(lines), kb
+
+
+# --------------------------------------------------------------------------- #
+# Luồng tạo phiếu
+# --------------------------------------------------------------------------- #
+def _new_draft() -> dict:
+    return {"vehicle": None, "groups": [], "lines": [], "emps": [], "emp_sel": [], "discount": 0,
+            "payment_key": "", "note": "", "models": [], "recent": [], "adj_index": None}
+
+
+@staff_only
+async def start_invoice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    d = ctx.user_data["draft"] = _new_draft()
+    try:
+        d["recent"] = (await api_of(ctx).recent_vehicles(6))[:6]
+    except BackendError as e:
+        log.warning("Không lấy được xe gần đây: %s", e.message)
+    rows = []
+    for i, r in enumerate(d["recent"]):
+        name = " ".join(x for x in (r.get("brandName"), r.get("modelName")) if x)
+        rows.append([btn(f"{r.get('licensePlate')} · {name}"[:60], f"rv:{i}")])
+    if rows:
+        rows.append(CANCEL_ROW)
+    await update.effective_message.reply_text(
+        "🧾 Tạo phiếu mới\n\nNhập biển số xe (VD: 51K-12345)" + ("\nhoặc chọn xe gần đây:" if rows else "")
+        + "\n(Gõ /huy để thoát)",
+        reply_markup=InlineKeyboardMarkup(rows) if rows else None)
+    return PLATE
+
+
+def _vehicle_from_check(res: dict, plate: str) -> dict:
+    v = res.get("vehicle") or {}
+    model = v.get("model") or {}
+    brand = v.get("brand") or model.get("brand") or {}
+    cust = v.get("customer") or res.get("customer") or {}
+    return {"plate": v.get("licensePlate") or plate,
+            "label": " ".join(x for x in (brand.get("brandName"), model.get("modelName")) if x),
+            "size": str(model.get("size") or "").upper(),
+            "brandCode": brand.get("code"), "modelCode": model.get("code"),
+            "customerId": cust.get("id"), "customerName": cust.get("customerName")}
+
+
+async def got_plate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    d = get_draft(ctx)
+    if d is None:
+        return await _expired(update)
+    plate = canonical_plate(update.message.text)
+    if not plate:
+        await update.message.reply_text("Biển số chưa đúng dạng, nhập lại nhé (VD: 51K-12345).")
+        return PLATE
+    try:
+        res = await api_of(ctx).check_plate(plate)
+    except BackendError as e:
+        await update.message.reply_text(f"⚠️ {e.message}\nNhập lại biển số để thử lại, hoặc /huy.")
+        return PLATE
+    if res.get("exists") and res.get("vehicle"):
+        d["vehicle"] = _vehicle_from_check(res, plate)
+        return await _size_or_services(update, ctx, d)
+    d["vehicle"] = {"plate": plate, "label": "", "size": "", "brandCode": None, "modelCode": None,
+                    "customerId": None, "customerName": None}
+    await update.message.reply_text(
+        f"🚗 {plate} — xe mới, chưa có trong hệ thống.\n\nNhập tên dòng xe (VD: Vios, CX-5, X5):",
+        reply_markup=InlineKeyboardMarkup([CANCEL_ROW]))
+    return MODEL
+
+
+async def pick_recent(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    d = get_draft(ctx)
+    if d is None:
+        return await _expired(update)
+    r = d["recent"][int(q.data.split(":", 1)[1])]
+    d["vehicle"] = {"plate": r.get("licensePlate") or "",
+                    "label": " ".join(x for x in (r.get("brandName"), r.get("modelName")) if x),
+                    "size": str(r.get("vehicleSize") or "").upper(),
+                    "brandCode": r.get("brandCode"), "modelCode": r.get("modelCode"),
+                    "customerId": r.get("customerId"), "customerName": r.get("customerName")}
+    return await _size_or_services(update, ctx, d)
+
+
+async def got_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    d = get_draft(ctx)
+    if d is None:
+        return await _expired(update)
+    try:
+        brands = await api_of(ctx).brands_with_models()
+    except BackendError as e:
+        return await _fail(update, ctx, e)
+    tokens = fold(update.message.text).split()
+    found = []
+    for b in brands:
+        for m in b.get("models") or []:
+            hay = fold(f"{b.get('brandName', '')} {m.get('modelName', '')}")
+            if tokens and all(t in hay for t in tokens):
+                found.append({"brandCode": b.get("code"), "brandName": b.get("brandName"),
+                              "modelCode": m.get("code"), "modelName": m.get("modelName"),
+                              "size": str(m.get("size") or "").upper()})
+    d["models"] = found[:8]
+    if not d["models"]:
+        await update.message.reply_text(
+            "Không thấy dòng xe này. Thử tên ngắn hơn (VD: 'vios'), hoặc thêm xe vào AlphaWash trước.",
+            reply_markup=InlineKeyboardMarkup([CANCEL_ROW]))
+        return MODEL
+    rows = [[btn(f"{m['brandName']} {m['modelName']}" + (f" ({m['size']})" if m["size"] else ""), f"mdl:{i}")]
+            for i, m in enumerate(d["models"])]
+    rows.append(CANCEL_ROW)
+    await update.message.reply_text("Chọn đúng dòng xe:", reply_markup=InlineKeyboardMarkup(rows))
+    return MODEL
+
+
+async def pick_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    d = get_draft(ctx)
+    if d is None:
+        return await _expired(update)
+    m = d["models"][int(q.data.split(":", 1)[1])]
+    d["vehicle"].update(label=f"{m['brandName']} {m['modelName']}", size=m["size"],
+                        brandCode=m["brandCode"], modelCode=m["modelCode"])
+    return await _size_or_services(update, ctx, d)
+
+
+async def _size_or_services(update: Update, ctx: ContextTypes.DEFAULT_TYPE, d: dict) -> int:
+    if d["vehicle"]["size"] in SIZES:
+        return await _to_services(update, ctx, d)
+    kb = InlineKeyboardMarkup([[btn(s, f"sz:{s}") for s in SIZES], CANCEL_ROW])
+    await show(update, f"{_head(d)}\n\nXe này chưa có size trong hệ thống. Chọn size:", kb)
+    return SIZE
+
+
+async def pick_size(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    d = get_draft(ctx)
+    if d is None:
+        return await _expired(update)
+    d["vehicle"]["size"] = q.data.split(":", 1)[1]
+    return await _to_services(update, ctx, d)
+
+
+async def _to_services(update: Update, ctx: ContextTypes.DEFAULT_TYPE, d: dict) -> int:
+    try:
+        raw = await api_of(ctx).quick_services()
+    except BackendError as e:
+        return await _fail(update, ctx, e)
+    d["groups"] = orders.groups_for_size(raw, d["vehicle"]["size"])
+    if not d["groups"]:
+        ctx.user_data.pop("draft", None)
+        await show(update, f"Chưa có dịch vụ nào có giá cho size {d['vehicle']['size']} trong AlphaWash.")
+        return ConversationHandler.END
+    text, kb = groups_view(d)
+    await show(update, text, kb)
+    return SERVICES
+
+
+async def open_group(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    d = get_draft(ctx)
+    if d is None:
+        return await _expired(update)
+    text, kb = group_view(d, int(q.data.split(":", 1)[1]))
+    await q.edit_message_text(text, reply_markup=kb)
+    return SERVICES
+
+
+async def back_to_groups(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    d = get_draft(ctx)
+    if d is None:
+        return await _expired(update)
+    text, kb = groups_view(d)
+    await q.edit_message_text(text, reply_markup=kb)
+    return SERVICES
+
+
+async def toggle_service(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    d = get_draft(ctx)
+    if d is None:
+        return await _expired(update)
+    _, gi, si = q.data.split(":")
+    s = d["groups"][int(gi)]["services"][int(si)]
+    existing = next((l for l in d["lines"] if l["code"] == s["code"]), None)
+    if existing:
+        d["lines"].remove(existing)
+    else:
+        d["lines"].append({"code": s["code"], "name": s["name"], "listed": s["price"],
+                           "adjusted": None, "reason": None})
+    text, kb = group_view(d, int(gi))
+    await q.edit_message_text(text, reply_markup=kb)
+    return SERVICES
+
+
+# ---- sửa giá từng dịch vụ (adjustedPrice + lý do) ---------------------------------
+async def adj_pick_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    d = get_draft(ctx)
+    if d is None:
+        await q.answer()
+        return await _expired(update)
+    if not d["lines"]:
+        await q.answer("Chưa chọn dịch vụ nào", show_alert=True)
+        return SERVICES
+    await q.answer()
+    rows = [[btn(f"{l['name']} — {money(orders.line_price(l))}" + (" ✏️" if l["adjusted"] is not None else ""),
+                 f"ap:{i}")] for i, l in enumerate(d["lines"])]
+    rows.append([btn("⬅️ Quay lại", "groups")])
+    await q.edit_message_text("✏️ Sửa giá dịch vụ nào?", reply_markup=InlineKeyboardMarkup(rows))
+    return ADJ_PICK
+
+
+async def adj_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    d = get_draft(ctx)
+    if d is None:
+        return await _expired(update)
+    i = int(q.data.split(":", 1)[1])
+    d["adj_index"] = i
+    l = d["lines"][i]
+    await q.edit_message_text(
+        f"✏️ {l['name']}\nGiá gốc: {money(l['listed'])}\n\nGõ:  giá mới | lý do\nVD:  150k | Khách VIP\n(giá 0 = tặng kèm)",
+        reply_markup=InlineKeyboardMarkup([[btn("↩️ Về giá gốc", f"ar:{i}")], [btn("⬅️ Quay lại", "groups")]]))
+    return ADJ_INPUT
+
+
+async def adj_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    d = get_draft(ctx)
+    if d is None:
+        return await _expired(update)
+    l = d["lines"][int(q.data.split(":", 1)[1])]
+    l["adjusted"], l["reason"] = None, None
+    text, kb = groups_view(d)
+    await q.edit_message_text(text, reply_markup=kb)
+    return SERVICES
+
+
+async def got_adj(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    d = get_draft(ctx)
+    if d is None or d["adj_index"] is None:
+        return await _expired(update)
+    price_txt, _, reason = update.message.text.partition("|")
+    price = parse_money(price_txt, allow_zero=True)
+    if price is None:
+        await update.message.reply_text("Chưa hiểu giá. Gõ lại dạng:  giá mới | lý do   (VD: 150k | Khách VIP)")
+        return ADJ_INPUT
+    l = d["lines"][d["adj_index"]]
+    l["adjusted"], l["reason"] = price, (reason.strip()[:100] or "Điều chỉnh giá")
+    text, kb = groups_view(d)
+    await update.message.reply_text(text, reply_markup=kb)
+    return SERVICES
+
+
+# ---- thợ thực hiện ---------------------------------------------------------------
+async def services_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    d = get_draft(ctx)
+    if d is None:
+        await q.answer()
+        return await _expired(update)
+    if not d["lines"]:
+        await q.answer("Chưa chọn dịch vụ nào", show_alert=True)
+        return SERVICES
+    await q.answer()
+    try:
+        emps = await api_of(ctx).employees()
+    except BackendError as e:
+        log.warning("Không lấy được danh sách thợ: %s", e.message)
+        emps = []
+    d["emps"] = [{"id": e["id"], "name": e["name"]} for e in emps
+                 if (e.get("workStatus") or "Working") == "Working" and e.get("name")]
+    d["emp_sel"] = []
+    if not d["emps"]:
+        return await _ask_discount(update, d)
+    text, kb = employees_view(d)
+    await q.edit_message_text(text, reply_markup=kb)
+    return EMPLOYEES
+
+
+async def toggle_employee(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    d = get_draft(ctx)
+    if d is None:
+        return await _expired(update)
+    eid = int(q.data.split(":", 1)[1])
+    if eid in d["emp_sel"]:
+        d["emp_sel"].remove(eid)
+    else:
+        d["emp_sel"].append(eid)
+    text, kb = employees_view(d)
+    await q.edit_message_text(text, reply_markup=kb)
+    return EMPLOYEES
+
+
+async def employees_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.callback_query.answer()
+    d = get_draft(ctx)
+    if d is None:
+        return await _expired(update)
+    return await _ask_discount(update, d)
+
+
+# ---- giảm giá / thanh toán / ghi chú -----------------------------------------------
+async def _ask_discount(update: Update, d: dict) -> int:
+    kb = InlineKeyboardMarkup([
+        [btn("Không giảm", "disc:0"), btn("5%", "disc:p5"), btn("10%", "disc:p10")],
+        [btn("✍️ Nhập số khác", "disc:other")], CANCEL_ROW])
+    await show(update, f"🧾 Tạm tính: {money(orders.subtotal(d['lines']))}\n\nGiảm giá?", kb)
+    return DISCOUNT
+
+
+async def pick_discount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    d = get_draft(ctx)
+    if d is None:
+        return await _expired(update)
+    choice = q.data.split(":", 1)[1]
+    if choice == "other":
+        await q.edit_message_text("✍️ Nhập số giảm giá\nVD:  200k   1tr   10%",
+                                  reply_markup=InlineKeyboardMarkup([CANCEL_ROW]))
+        return DISCOUNT_INPUT
+    d["discount"] = 0 if choice == "0" else int(orders.subtotal(d["lines"]) * int(choice[1:]) / 100)
+    return await _ask_payment(update)
+
+
+async def got_discount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    d = get_draft(ctx)
+    if d is None:
+        return await _expired(update)
+    amount = parse_discount(update.message.text, orders.subtotal(d["lines"]))
+    if amount is None:
+        await update.message.reply_text("Chưa hiểu số này. Nhập lại, VD: 200k, 1tr hoặc 10%")
+        return DISCOUNT_INPUT
+    d["discount"] = amount
+    return await _ask_payment(update)
+
+
+async def _ask_payment(update: Update) -> int:
+    opts = [btn(o["label"], f"pay:{o['key']}") for o in orders.payment_options()]
+    kb = InlineKeyboardMarkup([opts[i:i + 2] for i in range(0, len(opts), 2)] + [CANCEL_ROW])
+    await show(update, "Hình thức thanh toán?", kb)
+    return PAYMENT
+
+
+async def pick_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    d = get_draft(ctx)
+    if d is None:
+        return await _expired(update)
+    d["payment_key"] = q.data.split(":", 1)[1]
+    kb = InlineKeyboardMarkup([[btn("⏭ Bỏ qua", "skipnote")], CANCEL_ROW])
+    await q.edit_message_text("📝 Ghi chú (tình trạng xe, dặn dò...)\nGõ ghi chú hoặc bấm Bỏ qua.", reply_markup=kb)
+    return NOTE
+
+
+async def got_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    d = get_draft(ctx)
+    if d is None:
+        return await _expired(update)
+    note = update.message.text.strip()
+    if len(note) > 300:
+        await update.message.reply_text("Ghi chú dài quá (tối đa 300 ký tự), gõ ngắn lại nhé.")
+        return NOTE
+    d["note"] = note
+    text, kb = confirm_view(d)
+    await update.message.reply_text(text, reply_markup=kb)
+    return CONFIRM
+
+
+async def skip_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    d = get_draft(ctx)
+    if d is None:
+        return await _expired(update)
+    d["note"] = ""
+    text, kb = confirm_view(d)
+    await q.edit_message_text(text, reply_markup=kb)
+    return CONFIRM
+
+
+async def edit_services(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    return await back_to_groups(update, ctx)
+
+
+# ---- xuất phiếu -------------------------------------------------------------------
+async def deliver_invoice(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, order: dict) -> None:
+    """Gửi PDF hoá đơn: ưu tiên PDF của AlphaWash (có QR) nếu đã bật, ngược lại PDF tự vẽ."""
+    api = api_of(ctx)
+    inv = orders.order_to_invoice(order)
+    safe = re.sub(r"[^0-9A-Za-z._-]", "_", str(inv["number"]) or "hoadon")
+    if api.pdf_enabled():
+        try:
+            pdf = await api.download_invoice_pdf(str(order.get("id") or ""), str(order.get("code") or ""))
+            await ctx.bot.send_document(chat_id=chat_id, document=io.BytesIO(pdf), filename=f"{safe}.pdf",
+                                        caption=f"🧾 {inv['number']} · {inv['plate']}")
+            return
+        except BackendError as e:
+            log.error("Không lấy được PDF cho %s: %s", inv["number"], e.message)
+            notice = f"⚠️ Không lấy được PDF từ AlphaWash ({e.message}). PDF tự vẽ, KHÔNG có mã QR.\n"
+    else:
+        notice = ""
+    path = await asyncio.to_thread(render_invoice, inv)
+    with path.open("rb") as f:
+        await ctx.bot.send_document(chat_id=chat_id, document=f, filename=f"{safe}.pdf",
+                                    caption=f"{notice}🧾 {inv['number']} · {inv['plate']} · {money(inv['total'])}")
+
+async def confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    d = get_draft(ctx)
+    if d is None:
+        await q.answer("Phiếu này đã xuất hoặc đã huỷ.", show_alert=True)
+        return ConversationHandler.END
+    await q.answer("Đang tạo phiếu...")
+    user = update.effective_user
+    payload = orders.build_order_payload(d, user.full_name)
+    ctx.user_data.pop("draft", None)          # chặn bấm 2 lần -> trùng phiếu
+
+    api = api_of(ctx)
+    try:
+        order_id = await api.create_order(payload)
+    except BackendError as e:
+        if e.definitive:                      # BE chắc chắn chưa tạo -> cho sửa/thử lại
+            ctx.user_data["draft"] = d
+            text, kb = confirm_view(d)
+            await q.edit_message_text(f"⚠️ AlphaWash từ chối: {e.message}\n\n{text}", reply_markup=kb)
+            return CONFIRM
+        log.error("create-order không rõ kết quả: %s (NV %s)", e.message, user.id)
+        await q.edit_message_text(
+            f"⚠️ {e.message}\nChưa rõ phiếu đã được tạo hay chưa. KHÔNG tạo lại ngay — "
+            f"hãy kiểm tra trong AlphaWash (biển số {d['vehicle']['plate']}) rồi mới tạo lại nếu chưa có.")
+        return ConversationHandler.END
+
+    try:
+        order = await api.get_order(order_id)
+    except BackendError as e:
+        log.error("Đã tạo đơn %s nhưng không đọc lại được: %s", order_id, e.message)
+        await q.edit_message_text(
+            f"✅ Đã tạo phiếu trong AlphaWash nhưng chưa vẽ được ảnh ({e.message}).\n"
+            "Dùng /in <mã phiếu> để xuất ảnh sau.")
+        return ConversationHandler.END
+
+    number = order.get("code") or order_id
+    await q.edit_message_text(f"✅ Đã tạo phiếu {number}")
+    await deliver_invoice(ctx, q.message.chat_id, order)
+    log.info("Order %s created by %s (%s)", number, user.full_name, user.id)
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data.pop("draft", None)
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text("❌ Đã huỷ phiếu.")
+    else:
+        await update.effective_message.reply_text("❌ Đã huỷ phiếu.")
+    return ConversationHandler.END
+
+
+async def stale_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Nút cũ còn sót lại (vd bot vừa restart)."""
+    await update.callback_query.answer("Phiếu này đã hết hạn, gõ /hoadon để tạo lại.", show_alert=True)
+
+
+# --------------------------------------------------------------------------- #
+# Nhập nhanh: gõ 1 tin nhắn nhiều dòng, bot parse + tạo phiếu
+# --------------------------------------------------------------------------- #
+_QUICK_PLATE_RE = re.compile(r"\d{2}[A-Z]{1,2}[\-.]?\d{4,5}", re.IGNORECASE)
+
+
+def _quick_norm(s: str) -> str:
+    """Fold + chuẩn hoá viết tắt phổ biến (lv1 -> level 1)."""
+    s = fold(s)
+    s = re.sub(r"\blv\s*(\d)", r"level \1", s)
+    return s
+
+
+def _quick_tokens(s: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", _quick_norm(s))
+
+
+def _parse_quick(text: str) -> dict | None:
+    """Tách text người dùng gõ: dòng có biển số -> xe (kèm brand/model nếu có),
+    dòng bắt đầu @ -> thợ, còn lại -> dịch vụ. Không tìm thấy biển số -> None."""
+    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
+    result = {"plate": None, "brand": None, "model": None, "services": [], "employees": []}
+    for ln in lines:
+        if ln.startswith("@"):
+            name = ln[1:].strip()
+            if name:
+                result["employees"].append(name)
+            continue
+        if not result["plate"] and _QUICK_PLATE_RE.search(ln.upper()):
+            parts = [p.strip() for p in re.split(r"[\/|]", ln) if p.strip()]
+            if len(parts) >= 3:
+                result["brand"], result["model"], plate_txt = parts[0], parts[1], parts[2]
+            else:
+                plate_txt = _QUICK_PLATE_RE.search(ln.upper()).group(0)
+            result["plate"] = plate_txt
+            continue
+        result["services"].append(ln)
+    return result if result["plate"] else None
+
+
+def _find_service(groups: list[dict], query: str) -> dict | None:
+    q = _quick_tokens(query)
+    if not q:
+        return None
+    for g in groups:
+        for s in g["services"]:
+            hay = _quick_tokens(s["name"])
+            if all(t in hay for t in q):
+                return s
+    return None
+
+
+def _find_employee(emps: list[dict], query: str) -> dict | None:
+    q = _quick_tokens(query)
+    if not q:
+        return None
+    for e in emps:
+        if not e.get("name") or (e.get("workStatus") or "Working") != "Working":
+            continue
+        if all(t in _quick_tokens(e["name"]) for t in q):
+            return e
+    return None
+
+
+def _find_brand_model(brands: list[dict], brand_q: str, model_q: str) -> dict | None:
+    b_toks = _quick_tokens(brand_q or "")
+    m_toks = _quick_tokens(model_q or "")
+    for b in brands:
+        if b_toks and not all(t in _quick_tokens(b.get("brandName", "")) for t in b_toks):
+            continue
+        for m in b.get("models") or []:
+            if m_toks and not all(t in _quick_tokens(m.get("modelName", "")) for t in m_toks):
+                continue
+            return {"brandCode": b.get("code"), "brandName": b.get("brandName"),
+                    "modelCode": m.get("code"), "modelName": m.get("modelName"),
+                    "size": str(m.get("size") or "").upper()}
+    return None
+
+
+def _quick_summary(d: dict) -> str:
+    lines = ["🚀 Nhập nhanh — chọn hình thức thanh toán để tạo phiếu:", _head(d), ""]
+    for n, l in enumerate(d["lines"], 1):
+        lines.append(f"{n}. {l['name']} — {money(l['listed'])}")
+    lines.append(f"\n💰 TỔNG: {money(orders.subtotal(d['lines']))}")
+    if d["emps"]:
+        lines.append(f"Thực hiện: {', '.join(e['name'] for e in d['emps'])}")
+    return "\n".join(lines)
+
+
+@staff_only
+async def quick_invoice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    parsed = _parse_quick(update.message.text)
+    if not parsed:
+        await update.message.reply_text(
+            "Mình chưa nhận ra biển số trong tin nhắn.\n\n"
+            "Dạng nhập nhanh:\n"
+            "  Hãng/Dòng/Biển số      (VD: Mazda/CX-5/60K01968)\n"
+            "  <tên dịch vụ 1>\n"
+            "  <tên dịch vụ 2>\n"
+            "  @Tên thợ\n\n"
+            "Hoặc gõ /hoadon để tạo theo từng bước.")
+        return
+
+    api = api_of(ctx)
+    plate = canonical_plate(parsed["plate"])
+    if not plate:
+        await update.message.reply_text(f"Biển số '{parsed['plate']}' chưa đúng dạng.")
+        return
+
+    try:
+        res = await api.check_plate(plate)
+    except BackendError as e:
+        await update.message.reply_text(f"⚠️ {e.message}")
+        return
+
+    if res.get("exists") and res.get("vehicle"):
+        vehicle = _vehicle_from_check(res, plate)
+    else:
+        if not parsed.get("brand") or not parsed.get("model"):
+            await update.message.reply_text(
+                f"Xe {plate} chưa có trong AlphaWash. Ghi thêm hãng/dòng ở dòng đầu:\n"
+                f"VD:  Mazda/CX-5/{plate}")
+            return
+        try:
+            brands = await api.brands_with_models()
+        except BackendError as e:
+            await update.message.reply_text(f"⚠️ {e.message}")
+            return
+        found = _find_brand_model(brands, parsed["brand"], parsed["model"])
+        if not found:
+            await update.message.reply_text(
+                f"Không tìm thấy dòng xe '{parsed['brand']} {parsed['model']}' trong AlphaWash.")
+            return
+        vehicle = {"plate": plate, "label": f"{found['brandName']} {found['modelName']}",
+                   "size": found["size"], "brandCode": found["brandCode"],
+                   "modelCode": found["modelCode"], "customerId": None, "customerName": None}
+
+    if vehicle["size"] not in SIZES:
+        await update.message.reply_text(
+            f"Xe {plate} chưa có size trong AlphaWash. Dùng /hoadon để chọn size trước.")
+        return
+
+    if not parsed["services"]:
+        await update.message.reply_text("Chưa có dịch vụ nào trong tin nhắn.")
+        return
+
+    try:
+        raw = await api.quick_services()
+    except BackendError as e:
+        await update.message.reply_text(f"⚠️ {e.message}")
+        return
+    groups = orders.groups_for_size(raw, vehicle["size"])
+    matched, missing = [], []
+    for name in parsed["services"]:
+        s = _find_service(groups, name)
+        if s:
+            matched.append(s)
+        else:
+            missing.append(name)
+    if missing:
+        await update.message.reply_text(
+            f"Không nhận ra dịch vụ: {', '.join(missing)}.\n"
+            "Kiểm tra tên trong AlphaWash rồi thử lại, hoặc dùng /hoadon.")
+        return
+
+    matched_emps: list[dict] = []
+    missing_emps: list[str] = []
+    if parsed["employees"]:
+        try:
+            emps = await api.employees()
+        except BackendError as e:
+            await update.message.reply_text(f"⚠️ {e.message}")
+            return
+        for name in parsed["employees"]:
+            e = _find_employee(emps, name)
+            if e:
+                matched_emps.append({"id": e["id"], "name": e["name"]})
+            else:
+                missing_emps.append(name)
+
+    d = _new_draft()
+    d["vehicle"] = vehicle
+    d["lines"] = [{"code": s["code"], "name": s["name"], "listed": s["price"],
+                   "adjusted": None, "reason": None} for s in matched]
+    d["emps"] = matched_emps
+    d["emp_sel"] = [e["id"] for e in matched_emps]
+    d["payment_key"] = "bank"
+    ctx.user_data["draft"] = d
+
+    warning = (f"⚠️ Không tìm thấy thợ: {', '.join(missing_emps)} — phiếu sẽ tạo KHÔNG có thợ phụ trách "
+               "cho những tên này.\n\n") if missing_emps else ""
+    kb = InlineKeyboardMarkup([
+        [btn("💵 Tiền mặt", "qok:cash"), btn("🏦 Chuyển khoản", "qok:bank")],
+        [btn("💳 Thẻ", "qok:card"), btn("⏳ Chưa TT", "qok:unpaid")],
+        [btn("❌ Huỷ", "qcancel")],
+    ])
+    await update.message.reply_text(warning + _quick_summary(d), reply_markup=kb)
+
+
+@staff_only
+async def quick_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    d = get_draft(ctx)
+    if d is None:
+        await q.answer("Phiếu này đã hết hạn hoặc đã tạo rồi.", show_alert=True)
+        return
+    d["payment_key"] = q.data.split(":", 1)[1]
+    await q.answer("Đang tạo phiếu...")
+    user = update.effective_user
+    payload = orders.build_order_payload(d, user.full_name)
+    ctx.user_data.pop("draft", None)
+
+    api = api_of(ctx)
+    try:
+        order_id = await api.create_order(payload)
+    except BackendError as e:
+        if e.definitive:
+            ctx.user_data["draft"] = d
+            await q.edit_message_text(
+                f"⚠️ AlphaWash từ chối: {e.message}\n\n{_quick_summary(d)}",
+                reply_markup=q.message.reply_markup)
+            return
+        await q.edit_message_text(
+            f"⚠️ {e.message}\nChưa rõ phiếu đã tạo hay chưa — kiểm tra trong AlphaWash "
+            f"(biển số {d['vehicle']['plate']}) trước khi tạo lại.")
+        return
+
+    try:
+        order = await api.get_order(order_id)
+    except BackendError as e:
+        await q.edit_message_text(
+            f"✅ Đã tạo phiếu nhưng chưa lấy được để xuất PDF ({e.message}). "
+            f"Dùng /in <mã phiếu>.")
+        return
+
+    number = order.get("code") or order_id
+    await q.edit_message_text(f"✅ Đã tạo phiếu {number}")
+    await deliver_invoice(ctx, q.message.chat_id, order)
+    log.info("Quick order %s created by %s (%s)", number, user.full_name, user.id)
+
+
+async def quick_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx.user_data.pop("draft", None)
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_text("❌ Đã huỷ.")
+
+
+# --------------------------------------------------------------------------- #
+# Lệnh khác
+# --------------------------------------------------------------------------- #
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if user.id in config.STAFF_USER_IDS:
+        await update.message.reply_text(
+            "👋 Bot tạo phiếu Shine Autowerkz\n\n"
+            "🚀 NHẬP NHANH — gõ trực tiếp:\n"
+            "  Mazda/CX-5/60K01968\n"
+            "  Rửa lv1\n"
+            "  @Lê Thế Duy\n"
+            "→ bot tự parse, bấm 1 nút chọn thanh toán = xuất phiếu.\n\n"
+            "Hoặc dùng lệnh:\n"
+            "/hoadon — tạo phiếu từng bước (chi tiết)\n"
+            "/lichsu <biển số> — tra phiếu theo biển số\n"
+            "/in <mã phiếu> — xuất lại PDF phiếu\n"
+            "/huy — huỷ phiếu đang tạo"
+            + ("\n\nQuản lý:\n/homnay — doanh thu hôm nay" if user.id in config.ADMIN_USER_IDS else ""))
+    else:
+        await update.message.reply_text(_deny_text(user.id))
+
+
+async def cmd_myid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(f"ID Telegram của bạn: {update.effective_user.id}")
+
+
+@staff_only
+async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ctx.args:
+        await update.message.reply_text("Dùng: /lichsu 51K-12345")
+        return
+    plate = canonical_plate(" ".join(ctx.args))
+    if not plate:
+        await update.message.reply_text("Biển số chưa đúng dạng.")
+        return
+    try:
+        api = api_of(ctx)
+        res = await api.check_plate(plate)
+        cust = ((res.get("vehicle") or {}).get("customer")) or res.get("customer") or {}
+        if not res.get("exists"):
+            await update.message.reply_text("Không thấy xe này trong AlphaWash.")
+            return
+        if not cust.get("id"):
+            await update.message.reply_text("Xe này chưa gắn với khách nên chưa tra được lịch sử phiếu.")
+            return
+        rows = [r for r in await api.customer_invoices(cust["id"])
+                if plate_key(r.get("licensePlate") or "") == plate_key(plate)]
+    except BackendError as e:
+        await update.message.reply_text(f"⚠️ {e.message}")
+        return
+    if not rows:
+        await update.message.reply_text("Chưa có phiếu nào cho biển số này.")
+        return
+    rows.sort(key=lambda r: parse_dt(r.get("date")), reverse=True)
+    lines = [f"{r.get('code')} · {parse_dt(r.get('date')):%d/%m/%Y} · {money(r.get('totalPrice') or 0)}"
+             for r in rows[:5]]
+    await update.message.reply_text(f"🔎 {plate} — {len(rows)} phiếu, 5 gần nhất:\n" + "\n".join(lines)
+                                    + "\n\nXuất lại ảnh: /in <mã phiếu>")
+
+
+@staff_only
+async def cmd_reprint(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ctx.args:
+        await update.message.reply_text("Dùng: /in ORD-2026-000123")
+        return
+    try:
+        order = await api_of(ctx).get_order_by_code(ctx.args[0].strip())
+    except BackendError as e:
+        await update.message.reply_text(f"⚠️ {e.message}" if e.status != 404 else "Không tìm thấy mã phiếu này.")
+        return
+    if not order:
+        await update.message.reply_text("Không tìm thấy mã phiếu này.")
+        return
+    await deliver_invoice(ctx, update.effective_chat.id, order)
+
+
+@admin_only
+async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    fmt = config.get_mapping().get("dashboard_date_format", "%Y-%m-%d")
+    now = datetime.now(config.TZ)
+    try:
+        data = await api_of(ctx).dashboard(f"{now:{fmt}}", f"{now:{fmt}}",
+                                           f"{now - timedelta(days=1):{fmt}}", f"{now - timedelta(days=1):{fmt}}")
+    except BackendError as e:
+        await update.message.reply_text(f"⚠️ {e.message}")
+        return
+    kpi = data.get("kpiSummary") or {}
+    text = [f"📊 Hôm nay {now:%d/%m/%Y}: {kpi.get('periodInvoices') or 0} phiếu — "
+            f"{money(kpi.get('periodRevenue') or kpi.get('todayRevenue') or 0)}"]
+    for m in (data.get("revenueDashboard") or {}).get("revenueByPaymentMethod") or []:
+        text.append(f"  • {m.get('method')}: {money(m.get('amount') or 0)} ({m.get('count') or 0} phiếu)")
+    await update.message.reply_text("\n".join(text))
+
+
+async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    log.exception("Lỗi khi xử lý update", exc_info=ctx.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text("⚠️ Có lỗi xảy ra. Gõ /hoadon để thử lại.")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def post_init(app: Application) -> None:
+    await app.bot.set_my_commands([
+        BotCommand("hoadon", "Tạo phiếu thanh toán mới"),
+        BotCommand("lichsu", "Tra phiếu theo biển số"),
+        BotCommand("in", "Xuất lại ảnh phiếu theo mã"),
+        BotCommand("homnay", "Doanh thu hôm nay (quản lý)"),
+        BotCommand("huy", "Huỷ phiếu đang tạo"),
+    ])
+
+
+async def post_shutdown(app: Application) -> None:
+    await app.bot_data["api"].aclose()
+
+
+def build_app(api: AlphaWashClient | None = None) -> Application:
+    app = Application.builder().token(config.BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
+    app.bot_data["api"] = api or AlphaWashClient()
+
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("hoadon", start_invoice)],
+        states={
+            PLATE: [MessageHandler(TEXT, got_plate), CallbackQueryHandler(pick_recent, pattern=r"^rv:\d+$")],
+            MODEL: [MessageHandler(TEXT, got_model), CallbackQueryHandler(pick_model, pattern=r"^mdl:\d+$")],
+            SIZE: [CallbackQueryHandler(pick_size, pattern=r"^sz:(S|M|L|XL)$")],
+            SERVICES: [
+                CallbackQueryHandler(open_group, pattern=r"^g:\d+$"),
+                CallbackQueryHandler(back_to_groups, pattern=r"^groups$"),
+                CallbackQueryHandler(toggle_service, pattern=r"^s:\d+:\d+$"),
+                CallbackQueryHandler(adj_pick_view, pattern=r"^adj$"),
+                CallbackQueryHandler(services_done, pattern=r"^done$"),
+            ],
+            ADJ_PICK: [CallbackQueryHandler(adj_prompt, pattern=r"^ap:\d+$"),
+                       CallbackQueryHandler(back_to_groups, pattern=r"^groups$")],
+            ADJ_INPUT: [MessageHandler(TEXT, got_adj),
+                        CallbackQueryHandler(adj_reset, pattern=r"^ar:\d+$"),
+                        CallbackQueryHandler(back_to_groups, pattern=r"^groups$")],
+            EMPLOYEES: [CallbackQueryHandler(toggle_employee, pattern=r"^e:\d+$"),
+                        CallbackQueryHandler(employees_done, pattern=r"^edone$")],
+            DISCOUNT: [CallbackQueryHandler(pick_discount, pattern=r"^disc:")],
+            DISCOUNT_INPUT: [MessageHandler(TEXT, got_discount)],
+            PAYMENT: [CallbackQueryHandler(pick_payment, pattern=r"^pay:")],
+            NOTE: [MessageHandler(TEXT, got_note), CallbackQueryHandler(skip_note, pattern=r"^skipnote$")],
+            CONFIRM: [CallbackQueryHandler(confirm, pattern=r"^ok$"),
+                      CallbackQueryHandler(edit_services, pattern=r"^edit$")],
+        },
+        fallbacks=[CommandHandler("huy", cancel), CallbackQueryHandler(cancel, pattern=r"^cancel$")],
+        allow_reentry=True,
+        conversation_timeout=1800,     # 30 phút không thao tác -> tự đóng
+    )
+    app.add_handler(conv)
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("myid", cmd_myid))
+    app.add_handler(CommandHandler("lichsu", cmd_history))
+    app.add_handler(CommandHandler("in", cmd_reprint))
+    app.add_handler(CommandHandler("homnay", cmd_today))
+    app.add_handler(CommandHandler("huy", cancel))
+    app.add_handler(CallbackQueryHandler(quick_confirm, pattern=r"^qok:(cash|bank|card|unpaid)$"))
+    app.add_handler(CallbackQueryHandler(quick_cancel, pattern=r"^qcancel$"))
+    app.add_handler(MessageHandler(TEXT & filters.ChatType.PRIVATE, quick_invoice))
+    app.add_handler(CallbackQueryHandler(stale_button))
+    app.add_error_handler(on_error)
+    return app
+
+
+def main() -> None:
+    missing = [n for n, v in (("BOT_TOKEN", config.BOT_TOKEN), ("API_BASE_URL", config.API_BASE_URL),
+                              ("API_USERNAME", config.API_USERNAME), ("API_PASSWORD", config.API_PASSWORD)) if not v]
+    if missing:
+        raise SystemExit(f"Thiếu {', '.join(missing)} trong .env (xem .env.example).")
+    if config.API_BASE_URL.startswith("http://") and "localhost" not in config.API_BASE_URL \
+            and "127.0.0.1" not in config.API_BASE_URL:
+        log.warning("API_BASE_URL đang dùng http:// — mật khẩu và token đi qua mạng không mã hoá, hãy dùng https://")
+    if not config.STAFF_USER_IDS:
+        log.warning("Chưa có STAFF_USER_IDS/ADMIN_USER_IDS trong .env — nhắn /myid cho bot để lấy ID.")
+    build_app().run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
